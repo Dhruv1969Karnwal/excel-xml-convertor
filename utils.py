@@ -206,28 +206,48 @@ def xml_to_excel_internal(xml_path, output_path=None):
 # EXCEL TO XML CONVERSION FUNCTIONS
 # =============================================================================
 
-def sanitize_tag_name(name):
-    """Sanitize a string to be a valid XML tag name."""
+def sanitize_tag_name(name, preserve_special=True):
+    """Sanitize a string to be a valid XML tag name.
+    
+    Standard approach: removes spaces, preserves hyphens and periods.
+    
+    Args:
+        name: The string to sanitize
+        preserve_special: If True, preserves hyphens and periods (standard approach)
+    """
     if not name:
         return "element"
     
     name = str(name).strip()
     
+    # Handle pure numeric values (like column headers that are just numbers)
+    if name.replace('.', '').replace('-', '').isdigit():
+        return f"Column{name.replace('.', '').replace('-', '')}"
+    
+    # Standard XML approach: remove spaces, preserve hyphens and periods
     sanitized = ""
     for i, char in enumerate(name):
         if i == 0:
+            # First character must be letter or underscore
             if char.isalpha() or char == '_':
                 sanitized += char
+            elif char.isdigit():
+                # Start with underscore if first char is digit
+                sanitized += "_" + char
             else:
-                sanitized += "_" + char if char.isalnum() else "_"
+                sanitized += ""  # Skip invalid first characters
         else:
+            # Subsequent characters can include letters, digits, hyphens, underscores, periods
             if char.isalnum() or char in ['_', '-', '.']:
                 sanitized += char
+            elif char == ' ':
+                # Remove spaces (standard approach - concatenate words)
+                pass  # Skip spaces entirely
             else:
-                sanitized += "_"
+                sanitized += ""  # Remove other special characters
     
     if not sanitized or not (sanitized[0].isalpha() or sanitized[0] == '_'):
-        sanitized = "element_" + sanitized
+        sanitized = "element"
     
     if sanitized.lower().startswith("xml"):
         sanitized = "_" + sanitized
@@ -307,42 +327,70 @@ def prettify_xml(element):
 
 
 def detect_regions(ws):
-    """Detect contiguous blocks of data in a worksheet."""
-    regions = []
-    visited = set()
+    """Detect data regions in a worksheet.
     
+    Standard approach: treat the entire used range as a single region.
+    This ensures all rows are included, even those with empty cells.
+    """
     max_row = ws.max_row
     max_col = ws.max_column
     
+    # If sheet is empty, return empty list
+    if max_row is None or max_col is None or max_row == 0 or max_col == 0:
+        return []
+    
+    # Find the actual first row/column with data (header row)
+    first_row = 1
+    first_col = 1
+    
+    # Find first non-empty cell to start the region
     for r in range(1, max_row + 1):
         for c in range(1, max_col + 1):
-            if (r, c) not in visited and ws.cell(row=r, column=c).value is not None:
-                min_r, max_r, min_c, max_c = r, r, c, c
-                
-                stack = [(r, c)]
-                visited.add((r, c))
-                
-                while stack:
-                    curr_r, curr_c = stack.pop()
-                    min_r = min(min_r, curr_r)
-                    max_r = max(max_r, curr_r)
-                    min_c = min(min_c, curr_c)
-                    max_c = max(max_c, curr_c)
-                    
-                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                        nr, nc = curr_r + dr, curr_c + dc
-                        if 1 <= nr <= max_row and 1 <= nc <= max_col:
-                            if (nr, nc) not in visited and ws.cell(row=nr, column=nc).value is not None:
-                                visited.add((nr, nc))
-                                stack.append((nr, nc))
-                
-                regions.append((min_r, max_r, min_c, max_c))
+            if ws.cell(row=r, column=c).value is not None:
+                first_row = r
+                first_col = c
+                break
+        else:
+            continue
+        break
     
-    return sorted(regions, key=lambda x: (x[0], x[2]))
+    # Scan for actual last row with data
+    real_max_row = first_row
+    for r in range(max_row, first_row, -1):
+        is_empty = True
+        for c in range(1, max_col + 1):
+            if ws.cell(row=r, column=c).value is not None:
+                is_empty = False
+                break
+        if not is_empty:
+            real_max_row = r
+            break
+            
+    # Scan for actual last col with data
+    real_max_col = first_col
+    for c in range(max_col, first_col, -1):
+        is_empty = True
+        for r in range(1, real_max_row + 1):
+            if ws.cell(row=r, column=c).value is not None:
+                is_empty = False
+                break
+        if not is_empty:
+            real_max_col = c
+            break
+
+    # Return the real used range
+    return [(first_row, real_max_row, first_col, real_max_col)]
 
 
 def excel_to_xml_internal(excel_path, output_path=None, root_tag=None):
-    """Convert Excel to XML - internal implementation."""
+    """Convert Excel to XML using standard flat structure.
+    
+    Produces XML matching standard converter output:
+    - Root element is 'root' (or custom if specified)
+    - Each row becomes an element named after the sheet (with appropriate transformation)
+    - All columns are included, empty cells become self-closing tags
+    - Structure is flat (no Table/Item wrappers)
+    """
     try:
         wb = load_workbook(excel_path, data_only=True)
     except FileNotFoundError:
@@ -350,73 +398,79 @@ def excel_to_xml_internal(excel_path, output_path=None, root_tag=None):
     except Exception as e:
         raise ValueError(f"Invalid Excel file: {e}")
     
+    # Use 'root' as default root tag (standard approach)
     if root_tag is None:
-        root_tag = sanitize_tag_name(Path(excel_path).stem)
+        root_tag = "root"
     
     root = ET.Element(root_tag)
     
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
-        sheet_container = ET.SubElement(root, sanitize_tag_name(sheet_name))
         
+        # Detect data regions in the sheet
         regions = detect_regions(ws)
         
-        for i, (min_r, max_r, min_c, max_c) in enumerate(regions):
-            width = max_c - min_c + 1
-            height = max_r - min_r + 1
-            
-            if width == 2 and height <= 5:
-                metadata = ET.SubElement(sheet_container, "Metadata")
-                for r in range(min_r, max_r + 1):
-                    k = str(ws.cell(row=r, column=min_c).value or f"field_{r}")
-                    v = str(ws.cell(row=r, column=max_c).value or "")
-                    item = ET.SubElement(metadata, sanitize_tag_name(k))
-                    item.text = v
-                continue
-            
+        for region_idx, (min_r, max_r, min_c, max_c) in enumerate(regions):
+            # Get headers from first row of region
+            # Standard approach: use cell value as tag name if it's text,
+            # use positional Column{N} naming if value is numeric or empty
             headers = []
-            col_indices = []
             for c in range(min_c, max_c + 1):
                 val = ws.cell(row=min_r, column=c).value
+                col_position = c - min_c + 1  # 1-based position within region
+                
                 if val is not None:
-                    headers.append(str(val))
-                    col_indices.append(c)
+                    str_val = str(val).strip()
+                    # Check if value is purely numeric (not a valid header name)
+                    # Standard converters use Column{N} for numeric headers
+                    try:
+                        float(str_val)
+                        # It's numeric, use positional column name
+                        headers.append((c, f"Column{col_position}"))
+                    except ValueError:
+                        # It's text, use as header name
+                        headers.append((c, str_val))
+                else:
+                    # Empty cell, use positional column name
+                    headers.append((c, f"Column{col_position}"))
             
             if not headers:
                 continue
             
-            record_tag = sheet_name.rstrip('s') if sheet_name.endswith('s') else "Item"
-            record_tag = sanitize_tag_name(record_tag)
+            # Determine row element tag name from sheet name
+            # Transform sheet name for XML compatibility
+            row_tag = sanitize_tag_name(sheet_name)
             
-            table_container = ET.Element("Table")
-            
+            # Process each data row (skip header row)
             for r in range(min_r + 1, max_r + 1):
-                row_data = {}
-                has_data = False
-                for header, c in zip(headers, col_indices):
-                    val = ws.cell(row=r, column=c).value
-                    if val is not None:
-                        row_data[header] = val
-                        has_data = True
+                row_element = ET.SubElement(root, row_tag)
                 
-                if has_data:
-                    element = row_to_xml_element(row_data, headers, record_tag)
-                    table_container.append(element)
-            
-            if len(table_container) > 0:
-                sheet_container.append(table_container)
+                for col_idx, header_name in headers:
+                    cell_value = ws.cell(row=r, column=col_idx).value
+                    
+                    # Sanitize header for tag name
+                    tag_name = sanitize_tag_name(header_name)
+                    
+                    child = ET.SubElement(row_element, tag_name)
+                    
+                    if cell_value is not None:
+                        # Convert value to string, handle special characters
+                        str_value = str(cell_value)
+                        child.text = str_value
+                    # Empty cells become self-closing tags (child.text remains None)
     
     if output_path is None:
         output_path = Path(excel_path).with_suffix(".xml")
     
     xml_string = prettify_xml(root)
     
+    # Clean up XML declaration if duplicated
     lines = xml_string.split('\n')
     if lines[0].startswith('<?xml'):
         lines = lines[1:]
     
     with open(output_path, 'w', encoding='utf-8') as f:
-        f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        f.write('<?xml version="1.0" encoding="utf-8"?>\n')
         f.write('\n'.join(lines))
     
     return str(output_path)
